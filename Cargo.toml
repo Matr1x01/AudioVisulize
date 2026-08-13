@@ -1,0 +1,13 @@
+[package]
+name = "audio_processor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+cpal = "0.15"      # Cross-platform audio capture & output
+pollster = "0.3"
+realfft = "3.3"    # SIMD-accelerated real-to-complex FFT
+rustfft = "6.2"    # Dependency type definitions for realfft
+wgpu = "0.19"
+winit = "0.29"
