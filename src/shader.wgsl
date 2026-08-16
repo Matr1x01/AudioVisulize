@@ -18,6 +18,13 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // Premultiply so the additive-ish glow layers stack without darkening.
-    return vec4<f32>(in.color.rgb * in.color.a, in.color.a);
+    // Vertex colors arrive already premultiplied from the MeshBuilder, matching
+    // the pipeline's PREMULTIPLIED_ALPHA_BLENDING state. Interpolating them in
+    // premultiplied form is also what makes the one-pixel feathered edges ramp
+    // correctly: rgb and alpha fall to zero together, so an edge fades out
+    // instead of darkening toward black on the way.
+    //
+    // A vertex with rgb > 0 and a == 0 therefore composites as dst + src, which
+    // is how the glow layers accumulate additively without a second pipeline.
+    return in.color;
 }

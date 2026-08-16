@@ -1,9 +1,10 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use realfft::RealFftPlanner;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const FFT_SIZE: usize = 1024;
 pub const NUM_BINS: usize = FFT_SIZE / 2;
@@ -29,6 +30,64 @@ pub struct AudioMetrics {
     /// window function fades both ends to zero, which would show up as the
     /// trace collapsing at the edges of the screen.
     pub waveform: Vec<f32>,
+
+    // -- instrumentation ----------------------------------------------------
+    // Purely diagnostic; none of this changes the timing being measured.
+    /// Monotonic id of the *content*, bumped only when new audio actually
+    /// reached the analyser. A pass that saw no new input republishes the
+    /// previous `seq`, so the renderer can tell "recomputed identical data"
+    /// apart from "genuinely new spectrum" — counting analysis passes instead
+    /// would report a healthy update rate that is not really happening.
+    pub seq: u64,
+    /// When this spectrum was published. `None` before the first pass.
+    ///
+    /// Age at draw time (`now - produced_at`) is the metric that exposes the
+    /// producer/presenter phase drift; comparing rates alone hides it.
+    pub produced_at: Option<Instant>,
+    /// Input frames the capture callback delivered since the previous analysis
+    /// pass — i.e. the FFT hop that actually happened, as opposed to a nominal
+    /// configured one. Overlap is `1 - hop_frames / FFT_SIZE`.
+    pub hop_frames: u64,
+    /// Wall-clock gap between this analysis pass and the previous one.
+    pub analysis_dt_ms: f32,
+}
+
+/// Lock-free counters written from the real-time capture callback.
+///
+/// Deliberately atomics rather than fields on `AudioMetrics`: the whole point
+/// is to measure how long the callback waits on that mutex, so the measurement
+/// cannot itself take it.
+#[derive(Debug, Default)]
+pub struct AudioProbe {
+    /// Input frames delivered by the capture callback since startup.
+    pub frames_captured: AtomicU64,
+    /// Capture callbacks served.
+    pub callbacks: AtomicU64,
+    /// Longest single capture-callback execution, microseconds.
+    pub callback_max_us: AtomicU64,
+    /// Longest time a capture callback spent *waiting for the ring mutex*.
+    /// Non-zero means the render/analysis side is blocking the audio thread.
+    pub callback_lock_max_us: AtomicU64,
+    /// Analysis passes run, including ones that recomputed identical data.
+    pub analysis_passes: AtomicU64,
+    /// Analysis passes that saw no new input at all — a duplicated window.
+    pub stale_analyses: AtomicU64,
+    /// Analysis passes that skipped a full window or more of input — audio
+    /// that was captured and never analyzed.
+    pub dropped_windows: AtomicU64,
+}
+
+impl AudioProbe {
+    /// Monotonically raise a maximum without taking a lock.
+    fn raise_max(cell: &AtomicU64, v: u64) {
+        let mut cur = cell.load(Ordering::Relaxed);
+        while v > cur {
+            match cell.compare_exchange_weak(cur, v, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
 }
 
 /// Resolve the PulseAudio/PipeWire source to capture system playback from.
@@ -109,8 +168,14 @@ pub fn update_bands(spectrum: &[f32], edges: &[(usize, usize)], levels: &mut [f3
 /// Returns the live metrics handle plus the input stream — the stream must be
 /// kept alive by the caller (dropping it stops capture) even though it's never
 /// read from directly.
-pub fn spawn_audio_engine(
-) -> Result<(Arc<Mutex<AudioMetrics>>, u32, cpal::Stream), Box<dyn std::error::Error>> {
+pub type AudioEngine = (
+    Arc<Mutex<AudioMetrics>>,
+    Arc<AudioProbe>,
+    u32,
+    cpal::Stream,
+);
+
+pub fn spawn_audio_engine() -> Result<AudioEngine, Box<dyn std::error::Error>> {
     let host = cpal::default_host();
 
     // Point the ALSA pulse plugin at the output monitor before any stream opens.
@@ -149,19 +214,38 @@ pub fn spawn_audio_engine(
     // Shared thread-safe state to hold raw PCM samples
     let sample_ring = Arc::new(Mutex::new(Vec::<f32>::with_capacity(FFT_SIZE * channels)));
     let metrics_state = Arc::new(Mutex::new(AudioMetrics::default()));
+    let probe = Arc::new(AudioProbe::default());
 
     let ring_producer = Arc::clone(&sample_ring);
+    let probe_producer = Arc::clone(&probe);
 
     let stream = device.build_input_stream(
         &config.into(),
         move |data: &[f32], _: &cpal::InputCallbackInfo| {
+            // Instrumentation only. The lock acquisition below is measured, not
+            // avoided — establishing how long the real-time thread blocks is
+            // the point of this pass.
+            let entered = Instant::now();
             let mut lock = ring_producer.lock().unwrap();
+            let waited_us = entered.elapsed().as_micros() as u64;
+
             lock.extend_from_slice(data);
 
             if lock.len() > FFT_SIZE * channels {
                 let overflow = lock.len() - (FFT_SIZE * channels);
                 lock.drain(0..overflow);
             }
+            drop(lock);
+
+            probe_producer
+                .frames_captured
+                .fetch_add((data.len() / channels) as u64, Ordering::Relaxed);
+            probe_producer.callbacks.fetch_add(1, Ordering::Relaxed);
+            AudioProbe::raise_max(&probe_producer.callback_lock_max_us, waited_us);
+            AudioProbe::raise_max(
+                &probe_producer.callback_max_us,
+                entered.elapsed().as_micros() as u64,
+            );
         },
         |err| eprintln!("Audio stream error: {}", err),
         None,
@@ -171,6 +255,7 @@ pub fn spawn_audio_engine(
 
     let ring_consumer = Arc::clone(&sample_ring);
     let metrics_producer = Arc::clone(&metrics_state);
+    let probe_consumer = Arc::clone(&probe);
 
     thread::spawn(move || {
         let mut planner = RealFftPlanner::<f32>::new();
@@ -187,6 +272,10 @@ pub fn spawn_audio_engine(
         let bass_lo = 1usize;
         let bass_hi = (((250.0 / bin_hz).ceil() as usize).max(bass_lo + 1)).min(NUM_BINS);
 
+        let mut seq: u64 = 0;
+        let mut last_captured: u64 = 0;
+        let mut last_pass = Instant::now();
+
         loop {
             thread::sleep(Duration::from_millis(16)); // ~60 Hz processing rate
 
@@ -197,6 +286,36 @@ pub fn spawn_audio_engine(
                 }
                 lock.clone()
             };
+
+            // How far the capture actually advanced since the previous pass.
+            // This is the real FFT hop — it is not configured anywhere, it is
+            // whatever the wall clock and the callback cadence happened to
+            // produce, which is precisely the problem being measured.
+            let captured = probe_consumer.frames_captured.load(Ordering::Relaxed);
+            let hop_frames = captured.saturating_sub(last_captured);
+            last_captured = captured;
+
+            probe_consumer
+                .analysis_passes
+                .fetch_add(1, Ordering::Relaxed);
+            if hop_frames == 0 {
+                probe_consumer.stale_analyses.fetch_add(1, Ordering::Relaxed);
+            } else {
+                // Only new audio makes new content; see `AudioMetrics::seq`.
+                seq += 1;
+                if hop_frames >= FFT_SIZE as u64 {
+                    // The window advanced by at least its own length: there is
+                    // no overlap between consecutive analyses, and any excess
+                    // beyond FFT_SIZE is audio that is never analysed at all.
+                    probe_consumer
+                        .dropped_windows
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
+            let now = Instant::now();
+            let analysis_dt_ms = now.duration_since(last_pass).as_secs_f32() * 1000.0;
+            last_pass = now;
 
             // De-interleave Stereo Channels (L, R, L, R...)
             let mut left_sq_sum = 0.0f32;
@@ -254,8 +373,12 @@ pub fn spawn_audio_engine(
             metrics.right_rms = (right_sq_sum / FFT_SIZE as f32).sqrt();
             metrics.bass_energy = bass_energy;
             metrics.waveform = waveform;
+            metrics.seq = seq;
+            metrics.produced_at = Some(Instant::now());
+            metrics.hop_frames = hop_frames;
+            metrics.analysis_dt_ms = analysis_dt_ms;
         }
     });
 
-    Ok((metrics_state, sample_rate, stream))
+    Ok((metrics_state, probe, sample_rate, stream))
 }
