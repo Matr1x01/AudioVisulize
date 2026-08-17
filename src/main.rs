@@ -1,6 +1,9 @@
+mod bloom;
 mod hud;
 mod render;
 mod visuals;
+
+use bloom::Bloom;
 
 use audio_processor::{log_band_edges, spawn_audio_engine, update_bands, FFT_SIZE, NUM_BANDS};
 use hud::{FrameSample, Hud, StaticInfo};
@@ -173,6 +176,7 @@ struct GpuState {
     index_capacity: usize,
     sample_count: u32,
     msaa_view: Option<wgpu::TextureView>,
+    bloom: Bloom,
     timer: Option<GpuTimer>,
     present_mode: &'static str,
     available_modes: String,
@@ -325,6 +329,7 @@ impl GpuState {
         let index_capacity = 1 << 18;
         let index_buffer = Self::make_index_buffer(&device, index_capacity);
         let msaa_view = Self::make_msaa_view(&device, &config, sample_count);
+        let bloom = Bloom::new(&device, format, config.width, config.height);
         let timer = want_timing.then(|| GpuTimer::new(&device, &queue));
 
         // Record what the driver actually offers so the HUD can report whether
@@ -354,6 +359,7 @@ impl GpuState {
             index_capacity,
             sample_count,
             msaa_view,
+            bloom,
             timer,
             present_mode: "AUTOVSYNC",
             available_modes,
@@ -411,6 +417,7 @@ impl GpuState {
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
         self.msaa_view = Self::make_msaa_view(&self.device, &self.config, self.sample_count);
+        self.bloom.resize(&self.device, width, height);
     }
 
     /// Grow the mesh buffers on demand so a new visual can't silently overflow
@@ -469,11 +476,15 @@ impl GpuState {
                 .write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(indices));
         }
 
+        // The scene always renders into the bloom module's offscreen texture
+        // rather than the swapchain directly — the composite pass at the end
+        // of `self.bloom.render` is what actually writes the swapchain image.
         // With MSAA the pass draws into the multisampled texture and resolves
-        // into the swapchain image; without it, straight into the swapchain.
+        // into that offscreen texture; without it, straight into it.
+        let scene_target = self.bloom.scene_view();
         let (view, resolve_target) = match &self.msaa_view {
-            Some(msaa) => (msaa, Some(&surface_view)),
-            None => (&surface_view, None),
+            Some(msaa) => (msaa, Some(scene_target)),
+            None => (scene_target, None),
         };
 
         {
@@ -503,6 +514,8 @@ impl GpuState {
         if let Some(t) = self.timer.as_mut() {
             t.resolve_into(&mut encoder);
         }
+
+        self.bloom.render(&self.queue, &mut encoder, &surface_view);
 
         self.queue.submit(std::iter::once(encoder.finish()));
         timing.submit_ms = submit_start.elapsed().as_secs_f32() * 1000.0;
@@ -543,7 +556,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (i, v) in visualizers.iter().enumerate() {
         println!("  {}. {}", i + 1, v.name());
     }
-    println!("\nF1  toggle debug HUD\nF2  reset HUD statistics\nF3  dump HUD summary to stdout\n");
+    println!(
+        "\nF1  toggle debug HUD\nF2  reset HUD statistics\nF3  dump HUD summary to stdout\n\
+         F11 toggle fullscreen\nP   cycle color palette\n"
+    );
 
     let set_title = |window: &Window, v: &dyn Visualizer| {
         window.set_title(&format!("Audio Visualizer — {}", v.name()));
@@ -562,6 +578,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut hud = Hud::new();
     let mut band_scratch: Vec<f32> = Vec::with_capacity(NUM_BANDS);
     let mut last_present: Option<Instant> = None;
+    let mut fullscreen = false;
+    // Drives `update_bands`'s attack/release envelope; a plain wall-clock
+    // delta between redraws, same pattern as `visuals::Clock`.
+    let mut last_band_update: Option<Instant> = None;
 
     // `HUD_AUTODUMP=<seconds>` prints the summary on an interval instead of
     // needing an F3 keypress, so the numbers can be captured from a headless
@@ -608,6 +628,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         hud.dump(&probe);
                         None
                     }
+                    PhysicalKey::Code(KeyCode::F11) => {
+                        fullscreen = !fullscreen;
+                        window.set_fullscreen(fullscreen.then_some(
+                            winit::window::Fullscreen::Borderless(None),
+                        ));
+                        None
+                    }
+                    PhysicalKey::Code(KeyCode::KeyP) => {
+                        println!("→ palette {}", visuals::cycle_palette());
+                        None
+                    }
                     PhysicalKey::Code(code) => {
                         // Digit1..Digit9 are contiguous in the KeyCode enum.
                         let digits = [
@@ -647,12 +678,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let guard = metrics.lock().unwrap();
                 let lock_wait_ms = lock_start.elapsed().as_secs_f32() * 1000.0;
 
-                let (left_spec, right_spec, waveform, bass, rms, seq, produced_at, hop_frames) = {
+                let (
+                    left_spec,
+                    right_spec,
+                    waveform,
+                    left_wave,
+                    right_wave,
+                    bass,
+                    rms,
+                    seq,
+                    produced_at,
+                    hop_frames,
+                ) = {
                     let m = guard;
                     (
                         m.left_spectrum.clone(),
                         m.right_spectrum.clone(),
                         m.waveform.clone(),
+                        m.left_waveform.clone(),
+                        m.right_waveform.clone(),
                         m.bass_energy,
                         (m.left_rms + m.right_rms) * 0.5,
                         m.seq,
@@ -669,8 +713,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or(0.0);
 
                 if !left_spec.is_empty() {
-                    update_bands(&left_spec, &edges, &mut left_levels);
-                    update_bands(&right_spec, &edges, &mut right_levels);
+                    let band_dt = last_band_update
+                        .map(|p| frame_start.saturating_duration_since(p).as_secs_f32())
+                        .unwrap_or(0.0)
+                        .clamp(0.0, 0.1);
+                    last_band_update = Some(frame_start);
+                    update_bands(&left_spec, &edges, &mut left_levels, band_dt);
+                    update_bands(&right_spec, &edges, &mut right_levels, band_dt);
                     for i in 0..NUM_BANDS {
                         avg_levels[i] = (left_levels[i] + right_levels[i]) * 0.5;
                     }
@@ -699,6 +748,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     left_bands: &left_levels,
                     right_bands: &right_levels,
                     waveform: &waveform,
+                    left_waveform: &left_wave,
+                    right_waveform: &right_wave,
                     bass,
                     rms,
                     time: start.elapsed().as_secs_f32(),
@@ -724,6 +775,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     subdivisions: 10,
                     feathered: true,
                     visualizer: visualizers[current].name(),
+                    palette: visuals::current_palette_name(),
                 };
                 hud.note_bands(&avg_levels, &mut band_scratch);
                 hud.note_scene_geometry(scene_verts, scene_indices);

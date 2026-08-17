@@ -72,6 +72,10 @@ pub struct FrameData<'a> {
     pub right_bands: &'a [f32],
     /// Raw mono PCM for the current window (un-windowed).
     pub waveform: &'a [f32],
+    /// Raw per-channel PCM for the current window (un-windowed), for visuals
+    /// that plot one channel against the other.
+    pub left_waveform: &'a [f32],
+    pub right_waveform: &'a [f32],
     pub bass: f32,
     pub rms: f32,
     /// Seconds since startup, for animation that isn't audio-driven.

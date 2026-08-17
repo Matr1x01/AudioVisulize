@@ -30,6 +30,12 @@ pub struct AudioMetrics {
     /// window function fades both ends to zero, which would show up as the
     /// trace collapsing at the edges of the screen.
     pub waveform: Vec<f32>,
+    /// Raw per-channel PCM for the current window, *before* Hann windowing.
+    /// Needed by stereo time-domain visuals (vectorscope/Lissajous) that plot
+    /// one channel against the other — the mono `waveform` above has already
+    /// discarded that relationship by averaging L and R together.
+    pub left_waveform: Vec<f32>,
+    pub right_waveform: Vec<f32>,
 
     // -- instrumentation ----------------------------------------------------
     // Purely diagnostic; none of this changes the timing being measured.
@@ -123,43 +129,97 @@ pub fn display_range(sample_rate: u32) -> (f32, f32) {
     (20.0, 20_000.0f32.min(nyquist * 0.95))
 }
 
+/// Continuous (fractional) bin bounds for one display band. Unlike integer bin
+/// indices, these stay distinct for adjacent bands even when both fall inside
+/// the same underlying FFT bin — see [`update_bands`].
+pub type BandEdge = (f32, f32);
+
+/// Largest bin position any band edge may reach, leaving room for the
+/// `+1` neighbor `update_bands` interpolates against.
+fn max_bin_pos() -> f32 {
+    NUM_BINS as f32 - 1.001
+}
+
 /// Group the linear FFT bins into log-spaced display bands.
 ///
 /// Bins are evenly spaced in Hz, so a linear mapping crams every bass note into
 /// the first two columns and spends most of the display on near-silent treble.
 /// Log spacing gives each octave equal width, which is how pitch is perceived.
-pub fn log_band_edges(sample_rate: u32) -> Vec<(usize, usize)> {
+///
+/// Edges are kept as continuous bin positions rather than rounded to integers.
+/// With a 1024-point FFT the bass end of the log scale is narrower in Hz than
+/// one bin: dozens of consecutive low bands would round to the identical
+/// integer range (often a single bin) and read back bit-for-bit identical,
+/// which is what makes a whole cluster of bars move in lockstep. Fractional
+/// edges let `update_bands` interpolate a distinct value for each band even
+/// when they share a bin, at no cost in FFT latency or resolution.
+pub fn log_band_edges(sample_rate: u32) -> Vec<BandEdge> {
     let bin_hz = sample_rate as f32 / FFT_SIZE as f32;
     let (f_lo, f_hi) = display_range(sample_rate);
     let ratio = (f_hi / f_lo).powf(1.0 / NUM_BANDS as f32);
+    let max_pos = max_bin_pos();
 
     let mut edges = Vec::with_capacity(NUM_BANDS);
     let mut f = f_lo;
     for _ in 0..NUM_BANDS {
         let next = f * ratio;
         // Bin 0 is DC offset and never carries musical content.
-        let lo = ((f / bin_hz).floor() as usize).clamp(1, NUM_BINS - 1);
-        let hi = ((next / bin_hz).ceil() as usize).clamp(lo + 1, NUM_BINS);
+        let lo = (f / bin_hz).clamp(1.0, max_pos);
+        let hi = (next / bin_hz).clamp(lo, max_pos);
         edges.push((lo, hi));
         f = next;
     }
     edges
 }
 
-/// Collapse a spectrum into per-band levels, with fast attack and slow decay.
+/// Time constant for a band snapping up to a louder peak, in seconds.
 ///
-/// Without the decay the bars flicker harshly between frames; holding the peak
-/// and easing it down is what makes the motion readable.
-pub fn update_bands(spectrum: &[f32], edges: &[(usize, usize)], levels: &mut [f32]) {
+/// Not instant: with the fractional band edges above, neighboring bands at
+/// the bass end now sample slightly different fractional positions instead
+/// of literally duplicating one bin, so they can also swing more
+/// independently frame to frame. An instant attack turned that independence
+/// into a visibly jittery, jagged terrain; smoothing it over a couple of
+/// frames keeps the response snappy without reading as noise.
+const BAND_ATTACK_TAU: f32 = 0.05;
+/// Time constant for a band easing down toward a quieter peak, in seconds.
+const BAND_RELEASE_TAU: f32 = 0.22;
+
+/// Collapse a spectrum into per-band levels, with a fast-attack/slow-release
+/// envelope.
+///
+/// Both stages are exponential in wall-clock time (not a fixed per-frame
+/// ratio), so the motion looks the same at 30, 60 or 144 Hz — see
+/// `AutoRange` in `visuals.rs` for the same pattern.
+///
+/// Each band is sampled at several points across its continuous span, linearly
+/// interpolating the spectrum between bins, and the peak of those samples is
+/// kept — preserving "peak not mean" behavior while giving bands narrower
+/// than one bin a value that depends on exactly where in that bin they fall,
+/// instead of every such band reading the same rounded-off bin.
+pub fn update_bands(spectrum: &[f32], edges: &[BandEdge], levels: &mut [f32], dt: f32) {
+    const SAMPLES: usize = 4;
+    let max_pos = spectrum.len() as f32 - 1.001;
+    let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
+
     for (i, &(lo, hi)) in edges.iter().enumerate() {
-        // Peak rather than mean: a single strong tone shouldn't be averaged away
-        // by the silent bins sharing its band.
-        let peak = spectrum[lo..hi].iter().fold(0.0f32, |a, &b| a.max(b));
-        levels[i] = if peak > levels[i] {
-            peak
+        let lo = lo.clamp(0.0, max_pos);
+        let hi = hi.clamp(lo, max_pos);
+        let mut peak = 0.0f32;
+        for s in 0..SAMPLES {
+            let t = s as f32 / (SAMPLES - 1) as f32;
+            let pos = lo + (hi - lo) * t;
+            let i0 = pos.floor() as usize;
+            let frac = pos - i0 as f32;
+            let v = spectrum[i0] * (1.0 - frac) + spectrum[i0 + 1] * frac;
+            peak = peak.max(v);
+        }
+        let tau = if peak > levels[i] {
+            BAND_ATTACK_TAU
         } else {
-            levels[i] * 0.80 + peak * 0.20
+            BAND_RELEASE_TAU
         };
+        let alpha = 1.0 - (-dt / tau.max(1e-4)).exp();
+        levels[i] += (peak - levels[i]) * alpha;
     }
 }
 
@@ -321,12 +381,16 @@ pub fn spawn_audio_engine() -> Result<AudioEngine, Box<dyn std::error::Error>> {
             let mut left_sq_sum = 0.0f32;
             let mut right_sq_sum = 0.0f32;
             let mut waveform = vec![0.0f32; FFT_SIZE];
+            let mut left_wave = vec![0.0f32; FFT_SIZE];
+            let mut right_wave = vec![0.0f32; FFT_SIZE];
 
             for i in 0..FFT_SIZE {
                 let l = pcm_data[i * channels];
                 let r = if channels > 1 { pcm_data[i * channels + 1] } else { l };
 
                 waveform[i] = (l + r) * 0.5;
+                left_wave[i] = l;
+                right_wave[i] = r;
 
                 // Apply Hann Windowing to eliminate spectral leakage boundary artifacts
                 let hann = 0.5
@@ -373,6 +437,8 @@ pub fn spawn_audio_engine() -> Result<AudioEngine, Box<dyn std::error::Error>> {
             metrics.right_rms = (right_sq_sum / FFT_SIZE as f32).sqrt();
             metrics.bass_energy = bass_energy;
             metrics.waveform = waveform;
+            metrics.left_waveform = left_wave;
+            metrics.right_waveform = right_wave;
             metrics.seq = seq;
             metrics.produced_at = Some(Instant::now());
             metrics.hop_frames = hop_frames;

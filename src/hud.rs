@@ -229,6 +229,7 @@ pub struct StaticInfo {
     /// Whether strokes carry an alpha-feathered fringe.
     pub feathered: bool,
     pub visualizer: &'static str,
+    pub palette: &'static str,
 }
 
 // ---------------------------------------------------------------------------
@@ -671,7 +672,7 @@ impl Hud {
         }
 
         line!(white, "AUDIO VISUALIZER HUD    F1 HIDE  F2 RESET");
-        line!(dim, "VISUAL {}", info.visualizer);
+        line!(dim, "VISUAL {}  PALETTE {}", info.visualizer, info.palette);
         y += line_h * 0.4;
 
         // -- frame timing ---------------------------------------------------

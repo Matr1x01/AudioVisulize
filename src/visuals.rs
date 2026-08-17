@@ -22,6 +22,7 @@ use crate::render::{mix, resample_monotone, rgba, srgb_hex, FrameData, MeshBuild
 use audio_processor::NUM_BANDS;
 use std::collections::VecDeque;
 use std::f32::consts::TAU;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 /// All visualizers, in cycle order.
@@ -34,6 +35,7 @@ pub fn all() -> Vec<Box<dyn Visualizer>> {
         Box::new(SpectrumArea::new()),
         Box::new(RadialBurst::new()),
         Box::new(Oscilloscope::new()),
+        Box::new(Vectorscope::new()),
     ]
 }
 
@@ -50,7 +52,7 @@ pub fn all() -> Vec<Box<dyn Visualizer>> {
 /// of the ramp — the single most common reason a gradient reads badly. Warm
 /// white keeps red at full while ice white is red-deficient, so luminance
 /// still rises into the accent (0.866 -> 0.893) and it reads as white-hot.
-const RAMP_STOPS: [(f32, u32, f32); 6] = [
+const PALETTE_AURORA: [(f32, u32, f32); 6] = [
     (0.00, 0x2A1258, 0.35), // deep violet, dim base
     (0.22, 0x5E35B1, 0.50), // Deep Purple 600
     (0.45, 0x2979FF, 0.68), // Blue A400, electric blue
@@ -58,6 +60,53 @@ const RAMP_STOPS: [(f32, u32, f32); 6] = [
     (0.88, 0xDCF3FF, 0.95), // ice white
     (1.00, 0xFFF0E6, 0.98), // heat accent, warm white
 ];
+
+/// Alternate palette: magenta base through orange to a pale gold-white tip.
+/// Same construction rule as [`PALETTE_AURORA`] — the top stop stays close to
+/// white rather than a saturated hue, so luminance keeps rising to the top.
+const PALETTE_SUNSET: [(f32, u32, f32); 6] = [
+    (0.00, 0x220C1B, 0.35),
+    (0.22, 0x7A1E4B, 0.50),
+    (0.45, 0xE0446B, 0.68),
+    (0.68, 0xFF8A3D, 0.82),
+    (0.88, 0xFFE3B0, 0.95),
+    (1.00, 0xFFF6E8, 0.98),
+];
+
+/// Alternate palette: near-monochrome navy through cyan to white. Minimal hue
+/// shift, for a colder/instrument-panel look.
+const PALETTE_GLACIAL: [(f32, u32, f32); 6] = [
+    (0.00, 0x0B1B2A, 0.35),
+    (0.22, 0x123B5C, 0.50),
+    (0.45, 0x1E6FA8, 0.68),
+    (0.68, 0x4FC3E8, 0.82),
+    (0.88, 0xD7F3FF, 0.95),
+    (1.00, 0xFFFFFF, 0.98),
+];
+
+const PALETTES: [[(f32, u32, f32); 6]; 3] = [PALETTE_AURORA, PALETTE_SUNSET, PALETTE_GLACIAL];
+const PALETTE_NAMES: [&str; 3] = ["Aurora", "Sunset", "Glacial"];
+
+/// Index into [`PALETTES`] the shared ramp currently reads from.
+///
+/// A global rather than a parameter on `ramp()` because every visual calls
+/// `ramp()` through [`FrameData`]-free helpers (`color_at` closures deep in
+/// per-visual draw code) that have no reasonable path to carry a palette
+/// argument without threading it through every call site. Rendering is
+/// single-threaded, so plain `Relaxed` ordering is enough.
+static PALETTE_INDEX: AtomicUsize = AtomicUsize::new(0);
+
+pub fn current_palette_name() -> &'static str {
+    PALETTE_NAMES[PALETTE_INDEX.load(Ordering::Relaxed) % PALETTE_NAMES.len()]
+}
+
+/// Advance to the next palette and return its name, for a keybinding to print.
+pub fn cycle_palette() -> &'static str {
+    let next = (PALETTE_INDEX.load(Ordering::Relaxed) + 1) % PALETTES.len();
+    PALETTE_INDEX.store(next, Ordering::Relaxed);
+    PALETTE_NAMES[next]
+}
+
 
 /// Peak red/blue tilt applied by `freq_t`, as a fraction. Small on purpose:
 /// enough to separate bass from treble, not enough to fracture into rainbow.
@@ -215,14 +264,17 @@ const OSC_GLOW_LAYERS: u32 = 2;
 // ===========================================================================
 
 fn ramp_stops() -> &'static [(f32, [f32; 3], f32); 6] {
-    static STOPS: OnceLock<[(f32, [f32; 3], f32); 6]> = OnceLock::new();
-    STOPS.get_or_init(|| {
-        let mut out = [(0.0, [0.0; 3], 0.0); 6];
-        for (i, &(pos, hex, alpha)) in RAMP_STOPS.iter().enumerate() {
-            out[i] = (pos, srgb_hex(hex), alpha);
+    static STOPS: OnceLock<[[(f32, [f32; 3], f32); 6]; PALETTES.len()]> = OnceLock::new();
+    let decoded = STOPS.get_or_init(|| {
+        let mut out = [[(0.0, [0.0; 3], 0.0); 6]; PALETTES.len()];
+        for (p, table) in PALETTES.iter().enumerate() {
+            for (i, &(pos, hex, alpha)) in table.iter().enumerate() {
+                out[p][i] = (pos, srgb_hex(hex), alpha);
+            }
         }
         out
-    })
+    });
+    &decoded[PALETTE_INDEX.load(Ordering::Relaxed) % PALETTES.len()]
 }
 
 /// Shared color for every visual.
@@ -985,6 +1037,86 @@ impl Visualizer for Oscilloscope {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Vectorscope — stereo X/Y (Lissajous) trace.
+// ---------------------------------------------------------------------------
+
+/// Screen-space resolution of the trace.
+const VEC_POINTS: usize = 512;
+/// Radial clamp, and therefore the amplitude mapping to the top of the ramp.
+const VEC_MAX: f32 = 0.92;
+/// Additive glow layers under the core stroke.
+const VEC_GLOW_LAYERS: u32 = 2;
+
+/// Mid/side rotation, plotting `L-R` on X and `L+R` on Y rather than `L` and
+/// `R` directly. This is the standard broadcast vectorscope convention: mono
+/// material (`L == R`) collapses to a vertical line instead of a 45-degree
+/// diagonal, which is the orientation people expect this trace to rest at.
+pub struct Vectorscope {
+    pts: Vec<[f32; 2]>,
+}
+
+impl Vectorscope {
+    pub fn new() -> Self {
+        Self {
+            pts: Vec::with_capacity(VEC_POINTS),
+        }
+    }
+}
+
+impl Visualizer for Vectorscope {
+    fn name(&self) -> &'static str {
+        "Vectorscope"
+    }
+
+    fn draw(&mut self, frame: &FrameData, mesh: &mut MeshBuilder) {
+        let n = frame.left_waveform.len().min(frame.right_waveform.len());
+        if n < 64 {
+            return;
+        }
+
+        let aspect = mesh.aspect();
+        // Gain rides the signal level so quiet passages still fill the field,
+        // same rationale as the Oscilloscope.
+        let gain = 1.5 / frame.rms.max(0.02).sqrt().max(0.25);
+
+        // Reference graticule, drawn first so the trace paints over it.
+        mesh.ring([0.0, 0.0], VEC_MAX * 0.5, 1.0, [0.55, 0.6, 0.7, 0.10]);
+        mesh.ring([0.0, 0.0], VEC_MAX, 1.0, [0.55, 0.6, 0.7, 0.08]);
+
+        let points = VEC_POINTS.min(n);
+        let stride = (n / points).max(1);
+        let mut pts = std::mem::take(&mut self.pts);
+        pts.clear();
+        for k in 0..points {
+            let i = (k * stride).min(n - 1);
+            // Soft saturation rather than a hard clamp, so a loud passage
+            // compresses toward the edge of the field instead of clipping
+            // into a flat-topped square.
+            let l = (frame.left_waveform[i] * gain).tanh();
+            let r = (frame.right_waveform[i] * gain).tanh();
+            let side = (l - r) * 0.5;
+            let mid = (l + r) * 0.5;
+            pts.push([side * VEC_MAX / aspect, mid * VEC_MAX]);
+        }
+
+        if pts.len() >= 2 {
+            let last = (pts.len() - 1) as f32;
+            // Colored by radius from center: quiet/correlated signal near the
+            // origin reads dim violet, wide stereo swings reach the hot end.
+            let color_at = |t: f32| {
+                let idx = ((t * last).round() as usize).min(pts.len() - 1);
+                let p = pts[idx];
+                let radius = (p[0] * p[0] * aspect * aspect + p[1] * p[1]).sqrt() / VEC_MAX;
+                ramp(radius.clamp(0.0, 1.0), 0.5)
+            };
+            glow_stroke_with(mesh, &pts, 2.0, VEC_GLOW_LAYERS, &color_at);
+        }
+
+        self.pts = pts;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -996,6 +1128,8 @@ mod tests {
             left_bands: bands,
             right_bands: bands,
             waveform,
+            left_waveform: waveform,
+            right_waveform: waveform,
             bass: 0.5,
             rms: 0.2,
             time,
@@ -1160,6 +1294,32 @@ mod tests {
             luminance(tip) > luminance(base) * 20.0,
             "tip should be far brighter than base"
         );
+    }
+
+    /// Checked on the raw stop tables rather than through `ramp()`/the global
+    /// palette index, so this can't race with other tests mutating shared
+    /// state — `ramp()` linearly mixes between consecutive stops, and
+    /// luminance is a linear functional of rgb, so monotonicity at the stops
+    /// implies it holds along the whole curve between them.
+    #[test]
+    fn every_palette_is_monotone_in_luminance_and_alpha() {
+        for (name, table) in PALETTE_NAMES.iter().zip(PALETTES.iter()) {
+            let mut prev_lum = f32::NEG_INFINITY;
+            let mut prev_alpha = f32::NEG_INFINITY;
+            for &(pos, hex, alpha) in table.iter() {
+                let lum = luminance(rgba(srgb_hex(hex), alpha));
+                assert!(
+                    lum >= prev_lum - 1e-5,
+                    "{name} luminance fell to {lum} at stop {pos}"
+                );
+                assert!(
+                    alpha >= prev_alpha - 1e-5,
+                    "{name} alpha fell to {alpha} at stop {pos}"
+                );
+                prev_lum = lum;
+                prev_alpha = alpha;
+            }
+        }
     }
 
     /// Frequency must only modulate. If it dominated, two bars at the same
@@ -1419,6 +1579,8 @@ mod bench {
             left_bands: &bands,
             right_bands: &bands,
             waveform: &waveform,
+            left_waveform: &waveform,
+            right_waveform: &waveform,
             bass: 0.4,
             rms: 0.2,
             time: t,
